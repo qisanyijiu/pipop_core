@@ -1,0 +1,24 @@
+[package]
+name = "ptpip_core"
+version = "0.1.0"
+edition = "2024"
+
+
+[lib]
+name = "ptpip_core"  # 确保库名称与包名一致
+crate-type = ["staticlib"]  # 关键：编译为静态库（供 iOS 链接）
+path = "src/lib.rs"         # 库入口文件路径
+
+[dependencies]
+libc = "0.2"                # 提供 C 兼容类型（如 c_char、c_int）
+byteorder = "1.4"           # 处理字节序转换（网络协议必备）
+thiserror = "1.0"           # 简化自定义错误类型
+log = "0.4"                 # 日志记录
+cbindgen = "0.24"           # 生成 C 头文件（供 Swift 调用）
+rand = "0.8.5"
+env_logger = "0.9"
+tempfile = "3.8"  # 添加这一行，使用最新稳定版本
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
