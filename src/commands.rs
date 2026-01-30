@@ -1036,6 +1036,30 @@ mod tests {
     }
 
     #[test]
+    fn test_get_response_wrong_tid_then_ok() -> Result<()> {
+        // 第一个包: 错误 transaction_id 0x11111111
+        let packet1: Vec<u8> = [
+            0x00, 0x05, 0x00, 0x00, 0x11, 0x11, 0x11, 0x11, // type + reserved + tid
+            0x00, 0x00, 0x00, 0x08, // length 8
+            0x00, 0x00, 0x00, 0x00, // payload 4 bytes (8-4)
+        ].into();
+        // 第二个包: 正确 transaction_id 0x12345678
+        let packet2: Vec<u8> = [
+            0x00, 0x05, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78,
+            0x00, 0x00, 0x00, 0x0C,
+            0x00, 0x00, 0x20, 0x01, 0x00, 0x00, 0x00, 0x00, // Ok response
+        ].into();
+        let mut read_data = packet1;
+        read_data.extend_from_slice(&packet2);
+        let mut mock_stream = MockStream::new(&read_data);
+        let config = SessionConfig::default();
+        let response = get_response(&mut mock_stream, 0x12345678, &config)?;
+        assert_eq!(response.transaction_id, 0x12345678);
+        assert_eq!(response.payload, &[0x00, 0x00, 0x20, 0x01, 0x00, 0x00, 0x00, 0x00]);
+        Ok(())
+    }
+
+    #[test]
     fn test_check_response_error() -> Result<()> {
         // 正常响应: 前2字节版本，接着2字节响应码(Ok=0x2001)
         let mut payload = vec![0x00, 0x00, 0x20, 0x01]; // version(2) + response_code Ok(2)
@@ -1236,6 +1260,21 @@ mod tests {
     }
 
     #[test]
+    fn test_send_command_params_not_multiple_of_four() {
+        let mut mock_stream = MockStream::new(&[]);
+        let config = SessionConfig::default();
+        // 3 bytes: read_u32_be will fail (need 4 bytes)
+        let result = send_command(
+            &mut mock_stream,
+            PtpOperationCode::GetDeviceInfo as u16,
+            0x12345678,
+            &[0x01, 0x02, 0x03],
+            &config,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_check_response_error_insufficient_payload() {
         let packet = PtpIpPacket {
             message_type: PtpIpMessageType::ResponseBlock,
@@ -1248,6 +1287,7 @@ mod tests {
 
     #[test]
     fn test_check_response_error_device_errors() {
+        // response_code is read at payload bytes 2-3 (after version 2 bytes)
         for (code, _desc) in [
             (0x2002u16, "General error"),
             (0x2003, "Session not open"),
@@ -1258,9 +1298,9 @@ mod tests {
             (0x2008, "Invalid storage ID"),
             (0x2009, "Invalid object handle"),
         ] {
-            let mut payload = vec![0x00, 0x00, 0x00, 0x00];
-            payload.extend_from_slice(&code.to_be_bytes());
-            payload.extend_from_slice(&[0x00, 0x00]);
+            let mut payload = vec![0x00, 0x00]; // version
+            payload.extend_from_slice(&code.to_be_bytes()); // response_code at 2-3
+            payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // at least 8 bytes total
             let packet = PtpIpPacket {
                 message_type: PtpIpMessageType::ResponseBlock,
                 transaction_id: 0,
@@ -1297,6 +1337,16 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_storage_ids_insufficient_after_count() {
+        // 10 bytes pass initial check; count=1 at 8..12; only 1 byte left, read_u32_be fails
+        let mut data = vec![0u8; 8];
+        data.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+        data.push(0);
+        let result = parse_storage_ids(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_parse_object_handles_insufficient_data() {
         let data = [0u8; 8];
         let result = parse_object_handles(&data);
@@ -1304,8 +1354,30 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_object_handles_insufficient_after_count() {
+        let mut data = vec![0u8; 8];
+        data.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+        data.push(0);
+        let result = parse_object_handles(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_parse_object_info_insufficient_data() {
         let data = [0u8; 60];
+        let result = parse_object_info(&data, 1);
+        assert!(matches!(result, Err(PtpIpError::ProtocolError(_))));
+    }
+
+    #[test]
+    fn test_parse_object_info_extract_string_out_of_bounds() {
+        // 64 bytes fixed header; set filename_offset=1000 so extract_string fails
+        let mut data = vec![0u8; 64];
+        // at 8: storage_id(4)+object_format(2)+protection(1)+reserved(1)=8, position 16
+        // object_size(8)+thumb_size(4)=12, position 28
+        // 8 u32 offset/len start at 28: filename_offset at 28
+        data[28..32].copy_from_slice(&1000u32.to_be_bytes()); // filename_offset = 1000
+        data[32..36].copy_from_slice(&10u32.to_be_bytes());    // filename_len = 10
         let result = parse_object_info(&data, 1);
         assert!(matches!(result, Err(PtpIpError::ProtocolError(_))));
     }
@@ -1332,6 +1404,19 @@ mod tests {
         };
         let result = parse_event_packet(&packet);
         assert!(matches!(result, Err(PtpIpError::ProtocolError(_))));
+    }
+
+    #[test]
+    fn test_parse_event_packet_insufficient_params() {
+        // event_code(2) + param_count=1(2) = 4 bytes, then need 4 bytes for param; only 2 bytes
+        let data = [0x40, 0x01, 0x00, 0x01, 0x00, 0x00];
+        let packet = PtpIpPacket {
+            message_type: PtpIpMessageType::EventBlock,
+            transaction_id: 0,
+            payload: data.to_vec(),
+        };
+        let result = parse_event_packet(&packet);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1375,11 +1460,26 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_string_success_with_null() -> Result<()> {
+        let data = b"hello\0world";
+        let s = extract_string(data, 0, 11)?;
+        assert_eq!(s, "hello");
+        Ok(())
+    }
+
+    #[test]
     fn test_read_u8_be() -> Result<()> {
         let data = [0xAB];
         let mut cursor = Cursor::new(&data);
         assert_eq!(read_u8_be(&mut cursor)?, 0xAB);
         Ok(())
+    }
+
+    #[test]
+    fn test_read_u8_be_eof() {
+        let mut cursor = Cursor::new(vec![]);
+        let result = read_u8_be(&mut cursor);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1454,6 +1554,18 @@ mod tests {
         fs::write(&file_path, vec![0u8; 100])?;
         let (offset, _) = check_resume_state(&file_path, 100)?;
         assert_eq!(offset, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_resume_state_temp_only() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let file_path = temp_dir.path().join("test.jpg");
+        let temp_path = get_temp_path(&file_path);
+        fs::write(&temp_path, vec![0; 100])?;
+        // No resume file; only temp exists -> remove temp and start from 0
+        let (offset, _) = check_resume_state(&file_path, 1024)?;
+        assert_eq!(offset, 0);
         Ok(())
     }
 }
